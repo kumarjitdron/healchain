@@ -1,0 +1,352 @@
+# HealChain Aggregator - Backend Receiver
+# opaque receive
+
+"""
+HealChain Aggregator – Backend Receiver
+======================================
+
+Responsibilities:
+-----------------
+- Fetch opaque data blobs from backend
+- Provide simple polling interface for:
+    - miner submissions (M4)
+    - miner feedback (M5)
+
+SECURITY MODEL:
+---------------
+- Backend is UNTRUSTED
+- This module performs NO cryptographic validation
+- All received data is treated as potentially malicious
+"""
+
+import time
+import requests
+from typing import List, Dict, Optional
+
+from utils.logging import get_logger
+
+logger = get_logger("backend_iface.receiver")
+
+
+class BackendReceiver:
+    """
+    Thin client for receiving data from the backend relay.
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+        self.base_url = self._load_backend_url()
+        import os
+        # Use separate connect/read timeout to tolerate very large ciphertext payloads.
+        self._http_timeout = (
+            float(os.getenv("BACKEND_CONNECT_TIMEOUT", "5")),
+            float(os.getenv("BACKEND_READ_TIMEOUT", "120")),
+        )
+        self._ciphertext_retry_count = int(os.getenv("CIPHERTEXT_FETCH_RETRIES", "6"))
+        # Cache ciphertext once fetched so we don't keep hitting backend/DB
+        # for the same large payload on every polling cycle.
+        self._ciphertext_cache: Dict[str, object] = {}
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def fetch_submissions(self) -> List[Dict]:
+        """
+        Fetch miner submissions for this task.
+
+        Returns:
+        --------
+        List of submission dicts (possibly empty)
+        """
+
+        endpoint = f"{self.base_url}/aggregator/{self.task_id}/submissions"
+
+        try:
+            # Submissions payload can be large (ciphertext vectors), so allow longer read time.
+            resp = requests.get(endpoint, timeout=self._http_timeout)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[BackendReceiver] Submissions fetch failed "
+                    f"(status={resp.status_code})"
+                )
+                return []
+
+            data = resp.json()
+            if not isinstance(data, list):
+                logger.warning(
+                    "[BackendReceiver] Invalid submissions payload type"
+                )
+                return []
+
+            # Fetch ciphertext per submission to avoid massive single-response payloads.
+            # Backend returns lightweight metadata in this endpoint.
+            # IMPORTANT: reuse cached ciphertext for already-seen submissions to reduce
+            # backend Prisma load and avoid repeated large-row reads.
+            enriched: List[Dict] = []
+            for item in data:
+                grad_id = item.get("id")
+                if not grad_id:
+                    logger.warning("[BackendReceiver] Submission missing id; skipping")
+                    continue
+
+                ciphertext = self._ciphertext_cache.get(grad_id)
+                if ciphertext is None:
+                    ciphertext = self._fetch_submission_ciphertext(grad_id)
+                    if ciphertext is not None:
+                        self._ciphertext_cache[grad_id] = ciphertext
+
+                if ciphertext is None:
+                    logger.warning(
+                        f"[BackendReceiver] Missing ciphertext for submission id={grad_id}; skipping"
+                    )
+                    continue
+
+                item["ciphertext"] = ciphertext
+                enriched.append(item)
+
+            return enriched
+
+        except Exception as e:
+            logger.error(f"[BackendReceiver] Error fetching submissions: {e}")
+            return []
+
+    def _fetch_submission_ciphertext(self, gradient_id: str):
+        """
+        Fetch ciphertext blob for a single submission.
+        """
+        endpoint = (
+            f"{self.base_url}/aggregator/{self.task_id}/submissions/"
+            f"{gradient_id}/ciphertext"
+        )
+
+        # Retry a few times because backend may transiently fail while serving
+        # large ciphertext rows.
+        for attempt in range(self._ciphertext_retry_count):
+            try:
+                resp = requests.get(endpoint, timeout=self._http_timeout)
+                if resp.status_code == 200:
+                    payload = resp.json()
+                    return payload.get("ciphertext")
+                logger.warning(
+                    f"[BackendReceiver] Ciphertext fetch failed for {gradient_id} "
+                    f"(status={resp.status_code}, attempt={attempt + 1}/{self._ciphertext_retry_count})"
+                )
+            except Exception:
+                logger.warning(
+                    f"[BackendReceiver] Ciphertext fetch exception for {gradient_id} "
+                    f"(attempt={attempt + 1}/{self._ciphertext_retry_count})"
+                )
+
+            # Small backoff before retrying
+            if attempt < self._ciphertext_retry_count - 1:
+                time.sleep(0.8 * (attempt + 1))
+
+        return None
+
+    def fetch_feedback(self) -> List[Dict]:
+        """
+        Fetch miner feedback messages for this task.
+
+        Returns:
+        --------
+        List of feedback dicts (possibly empty)
+        """
+
+        endpoint = f"{self.base_url}/verification/{self.task_id}"
+
+        try:
+            resp = requests.get(endpoint, timeout=5)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[BackendReceiver] Feedback fetch failed "
+                    f"(status={resp.status_code})"
+                )
+                return []
+
+            data = resp.json()
+            if not isinstance(data, list):
+                logger.warning(
+                    "[BackendReceiver] Invalid feedback payload type"
+                )
+                return []
+
+            # Normalize backend feedback to aggregator format
+            normalized_batch = []
+            for fb in data:
+                miner_obj = fb.get("miner") if isinstance(fb.get("miner"), dict) else {}
+                message = fb.get("message")
+                miner_pk_from_message = self._extract_miner_pk_from_feedback_message(message)
+                normalized = {
+                    "task_id": fb.get("taskID"),
+                    "miner_pk": (
+                        fb.get("minerPublicKey")
+                        or miner_obj.get("publicKey")
+                        or miner_pk_from_message
+                    ),
+                    "verdict": fb.get("verdict"),
+                    "signature": fb.get("signature"),
+                    "candidate_hash": fb.get("candidateHash"),
+                    "reason": fb.get("reason", ""),
+                    "message": message,
+                }
+                normalized_batch.append(normalized)
+
+            return normalized_batch
+
+        except Exception as e:
+            logger.error(f"[BackendReceiver] Error fetching feedback: {e}")
+            return []
+
+    def fetch_key_derivation_metadata(self) -> Optional[Dict]:
+        """
+        Fetch key derivation metadata from backend (Algorithm 2.2).
+
+        Algorithm 2: The aggregator derives skFE deterministically using:
+        skFE = H(publisher || minerPKs || taskID || nonceTP)
+
+        This endpoint returns all inputs needed for derivation.
+
+        Returns:
+        --------
+        metadata : Optional[Dict]
+            {
+                "taskID": str,
+                "publisher": str,
+                "minerPublicKeys": List[str],
+                "nonceTP": str,
+                "aggregatorAddress": str,
+                "minerCount": int
+            }
+            or None if error
+        """
+
+        endpoint = f"{self.base_url}/aggregator/key-derivation/{self.task_id}"
+
+        try:
+            resp = requests.get(endpoint, timeout=5)
+
+            if resp.status_code == 404:
+                logger.warning(
+                    "[BackendReceiver] Task not found for key derivation"
+                )
+                return None
+
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[BackendReceiver] Key derivation metadata fetch failed "
+                    f"(status={resp.status_code}): {resp.text}"
+                )
+                return None
+
+            data = resp.json()
+
+            # Validate required fields
+            required = ["taskID", "publisher", "minerPublicKeys", "nonceTP"]
+            if not all(field in data for field in required):
+                logger.warning(
+                    "[BackendReceiver] Invalid key derivation metadata payload"
+                )
+                return None
+
+            logger.info(
+                f"[BackendReceiver] Key derivation metadata fetched: "
+                f"{data.get('minerCount', 0)} miners"
+            )
+            return data
+
+        except Exception as e:
+            logger.error(
+                f"[BackendReceiver] Error fetching key derivation metadata: {e}"
+            )
+            return None
+
+    def fetch_task_public_keys(self) -> Optional[Dict]:
+        """
+        Fetch task-scoped NDD-FE public keys from backend.
+
+        Returns:
+        --------
+        {
+            "taskID": str,
+            "tpPublicKey": str,
+            "aggregatorPublicKey": str,
+            "aggregatorAddress": str | None,
+        }
+        """
+        endpoint = f"{self.base_url}/tasks/{self.task_id}/public-keys"
+        try:
+            resp = requests.get(endpoint, timeout=5)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[BackendReceiver] Task public-keys fetch failed "
+                    f"(status={resp.status_code})"
+                )
+                return None
+            data = resp.json()
+            if not isinstance(data, dict):
+                logger.warning("[BackendReceiver] Invalid task public-keys payload type")
+                return None
+            return data
+        except Exception as e:
+            logger.error(f"[BackendReceiver] Error fetching task public-keys: {e}")
+            return None
+
+    def fetch_task_details(self) -> Optional[Dict]:
+        """
+        Fetch task details from backend /tasks/:taskID.
+
+        Returns:
+        --------
+        Task dict or None on error.
+        """
+        endpoint = f"{self.base_url}/tasks/{self.task_id}"
+        try:
+            resp = requests.get(endpoint, timeout=5)
+            if resp.status_code != 200:
+                logger.warning(
+                    f"[BackendReceiver] Task details fetch failed "
+                    f"(status={resp.status_code})"
+                )
+                return None
+            data = resp.json()
+            if not isinstance(data, dict):
+                logger.warning("[BackendReceiver] Invalid task details payload type")
+                return None
+            return data
+        except Exception as e:
+            logger.error(f"[BackendReceiver] Error fetching task details: {e}")
+            return None
+
+    # ------------------------------------------------------------------
+    # Internal Helpers
+    # ------------------------------------------------------------------
+
+    def _load_backend_url(self) -> str:
+        """
+        Load backend base URL from environment.
+        """
+
+        import os
+
+        url = os.getenv("BACKEND_URL")
+        if not url:
+            raise EnvironmentError("BACKEND_URL not set")
+
+        logger.info(f"[BackendReceiver] Using backend URL: {url}")
+        return url.rstrip("/")
+
+    @staticmethod
+    def _extract_miner_pk_from_feedback_message(message: object) -> Optional[str]:
+        """
+        Canonical feedback message format:
+            task_id|candidate_hash|verdict|reason|miner_pk
+
+        Reason may include '|', so split only from the right once.
+        """
+        if not isinstance(message, str) or "|" not in message:
+            return None
+        try:
+            return message.rsplit("|", 1)[1]
+        except Exception:
+            return None

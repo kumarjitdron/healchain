@@ -1,0 +1,585 @@
+
+"""
+HealChain Aggregator – Main Orchestrator
+======================================
+
+Implements Modules:
+- M4: Secure Aggregation + BSGS Recovery
+- M5: Miner Verification Feedback
+- M6: Candidate Block Build & Publish
+
+IMPORTANT:
+- Does NOT train models
+- Does NOT perform encryption
+- Does NOT interact with smart contracts directly
+- Treats backend as an untrusted relay
+
+This file coordinates task-scoped execution only.
+"""
+
+import os
+import time
+import threading
+from typing import Dict, List, Optional
+
+from config.constants import (
+    MIN_PARTICIPANTS,  # Default fallback
+    AGGREGATION_TIMEOUT,
+    BACKEND_POLL_INTERVAL,
+    FEEDBACK_TIMEOUT,
+    TASK_STATE_COLLECTING,
+    TASK_STATE_AGGREGATING,
+    TASK_STATE_VERIFYING,
+    TASK_STATE_PUBLISHED,
+    TASK_STATE_ABORTED,
+)
+
+from state.task_state import TaskState
+from state.key_manager import KeyManager
+from state.progress import ProgressTracker
+
+from backend_iface.receiver import BackendReceiver
+from backend_iface.sender import BackendSender
+
+from aggregation.collector import collect_and_validate_submissions
+from aggregation.aggregator import secure_aggregate
+
+from model.apply_update import apply_model_update
+from model.evaluate import evaluate_model
+from model.artifact import publish_model_artifact, compute_candidate_model_hash
+from model.vector_model import VectorModel
+from model.loader import load_base_model_from_link
+from model.runtime_evaluator import build_runtime_evaluator
+
+from consensus.candidate import build_candidate_block
+from consensus.feedback import collect_feedback
+from consensus.majority import has_majority
+
+from utils.logging import get_logger
+from utils.env_sync import sync_task_keys_to_env
+from utils.signing import sign_hash_hex_with_scalar
+
+logger = get_logger("aggregator.main")
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str) -> Optional[float]:
+    raw = os.getenv(name)
+    if raw is None or str(raw).strip() == "":
+        return None
+    try:
+        val = float(str(raw).strip())
+    except Exception as e:
+        raise ValueError(f"{name} must be a float in [0.0, 1.0], got: {raw!r}") from e
+    if not (0.0 <= val <= 1.0):
+        raise ValueError(f"{name} must be in [0.0, 1.0], got: {val}")
+    return val
+
+
+class HealChainAggregator:
+    """
+    Task-scoped Aggregator instance.
+
+    One instance == one taskID
+    """
+
+    def __init__(self, task_id: str):
+        self.task_id = task_id
+
+        self.state = TaskState(task_id)
+        self.keys = KeyManager(task_id)
+        self.progress = ProgressTracker(task_id)
+
+        self.backend_rx = BackendReceiver(task_id)
+        self.backend_tx = BackendSender(task_id)
+
+        self.running = False
+        self.runtime_evaluator = None
+        self.runtime_evaluator_source = None
+
+    # ------------------------------------------------------------------
+    # Entry point
+    # ------------------------------------------------------------------
+
+    def run(self):
+        logger.info(f"[Aggregator] Starting task {self.task_id}")
+        self.running = True
+
+        # Load cryptographic material
+        self._initialize_keys()
+
+        # =========================
+        # M4: Secure Aggregation
+        # =========================
+        self.state.set_status(TASK_STATE_COLLECTING)
+        submissions = self._wait_for_submissions()
+
+        self.state.set_status(TASK_STATE_AGGREGATING)
+        aggregate = self._secure_aggregate(submissions)
+
+        updated_model, acc = self._update_and_evaluate(aggregate)
+
+        # =========================
+        # Algorithm 4: Accuracy Check (Lines 35-40)
+        # =========================
+        if acc < self.state.required_accuracy:
+            if self.state.is_complete():
+                self.state.set_status("FAILED_ACCURACY")
+                raise RuntimeError(
+                    f"Accuracy target not reached and max rounds exhausted: "
+                    f"acc={acc:.4f}, required={self.state.required_accuracy:.4f}, "
+                    f"round={self.state.round}, max_rounds={self.state.max_rounds}"
+                )
+
+            logger.warning(
+                f"[Aggregator] Accuracy {acc:.4f} < {self.state.required_accuracy:.4f}. "
+                f"Starting next round (current round: {self.state.round})."
+            )
+            self.state.set_status("BACK_TO_TRAINING")
+
+            # Strict iterative Algorithm-4 retrain flow:
+            # carry W_new into next round as the new base model link.
+            retrain_model_link, retrain_model_hash = publish_model_artifact(
+                updated_model,
+                task_id=self.task_id,
+                round_no=self.state.round,
+            )
+            logger.info(
+                "[Aggregator] Low-accuracy retrain artifact published "
+                f"(round={self.state.round}, modelLink={retrain_model_link}, "
+                f"modelHash={retrain_model_hash[:12]}...)"
+            )
+
+            if self.backend_tx.reset_round(model_link=retrain_model_link):
+                logger.info("[Aggregator] Round reset successful. Aggregator exiting.")
+                self.running = False
+                return
+            else:
+                logger.error("[Aggregator] Failed to trigger round reset in backend.")
+                self.state.set_status(TASK_STATE_ABORTED)
+                raise RuntimeError("Round reset failed")
+
+        # =========================
+        # M4: Candidate Formation
+        # =========================
+        candidate = self._form_candidate(updated_model, acc, submissions)
+
+        # =========================
+        # M5: Miner Verification
+        # =========================
+        if not self._run_miner_verification(candidate):
+            logger.error("[Aggregator] Candidate rejected by miners")
+            self.state.set_status("REJECTED_BY_MINERS")
+            self.running = False
+            return
+
+        # =========================
+        # M6: Publish Payload
+        # =========================
+        self._publish_candidate(candidate)
+        self.state.set_status(TASK_STATE_PUBLISHED)
+
+        logger.info(f"[Aggregator] Task {self.task_id} completed (awaiting reveal)")
+        self.running = False
+
+    # ------------------------------------------------------------------
+    # Initialization
+    # ------------------------------------------------------------------
+
+    def _get_min_participants(self) -> int:
+        """
+        Get task-specific min participants from backend metadata.
+        Falls back to MIN_PARTICIPANTS constant if not available.
+        """
+        try:
+            # Try to get from backend task metadata
+            metadata = self.backend_rx.fetch_key_derivation_metadata()
+            if metadata and "minMiners" in metadata:
+                return int(metadata["minMiners"])
+        except Exception as e:
+            logger.warning(f"[Aggregator] Could not fetch minMiners from backend: {e}")
+        
+        # Fallback to constant
+        return MIN_PARTICIPANTS
+
+    def _get_max_participants(self) -> int:
+        """
+        Get task-specific max participants from backend metadata.
+        Falls back to MAX_PARTICIPANTS constant if not available.
+        """
+        try:
+            # Try to get from backend task metadata
+            metadata = self.backend_rx.fetch_key_derivation_metadata()
+            if metadata and "maxMiners" in metadata:
+                return int(metadata["maxMiners"])
+        except Exception as e:
+            logger.warning(f"[Aggregator] Could not fetch maxMiners from backend: {e}")
+        
+        # Fallback to constant (from limits.py)
+        from config.limits import MAX_MINERS
+        return MAX_MINERS
+
+    def _initialize_keys(self):
+        """
+        Load skA, skFE, pkTP, weight vector y.
+        
+        Algorithm 2.2: skFE is derived from backend metadata (deterministic).
+        """
+        import os
+        
+        # Get aggregator address from environment
+        aggregator_address = os.getenv("AGGREGATOR_ADDRESS")
+        
+        # Fetch metadata once to share between components
+        metadata = self.backend_rx.fetch_key_derivation_metadata()
+        if not metadata:
+            raise RuntimeError("Could not fetch task metadata from backend")
+        task_public_keys = self.backend_rx.fetch_task_public_keys() or {}
+
+        try:
+            changed_keys = sync_task_keys_to_env(self.task_id, task_public_keys)
+            if changed_keys:
+                logger.info(
+                    f"[Aggregator] Synced task keys into .env: {', '.join(changed_keys)}"
+                )
+        except Exception as e:
+            logger.warning(f"[Aggregator] Failed to sync task keys into .env: {e}")
+
+        # Load keys (skFE will be derived from backend using metadata)
+        self.keys.load(
+            aggregator_address=aggregator_address,
+            metadata=metadata,
+            task_public_keys=task_public_keys,
+        )
+        # Load state metadata
+        self.state.load_metadata(metadata=metadata)
+
+        # Fetch full task details (includes initialModelLink and status fields).
+        task_details = self.backend_rx.fetch_task_details() or {}
+        task_status = str(task_details.get("status") or "").upper()
+        if task_status and task_status not in {"OPEN", "AGGREGATING"}:
+            raise RuntimeError(
+                f"Task {self.task_id} status is '{task_status}'. "
+                "Aggregation can run only when task status is OPEN or AGGREGATING."
+            )
+        self.state.initial_model_link = task_details.get("initialModelLink")
+
+        self.runtime_evaluator, self.runtime_evaluator_source = build_runtime_evaluator(
+            task_id=self.task_id,
+            task_details=task_details,
+        )
+        if self.runtime_evaluator is not None:
+            logger.info(
+                f"[Aggregator] Runtime evaluator configured ({self.runtime_evaluator_source})"
+            )
+
+        allow_zero_base = _env_flag("AGGREGATOR_ALLOW_ZERO_BASE_MODEL", default=False)
+        require_runtime_eval = _env_flag(
+            "AGGREGATOR_REQUIRE_RUNTIME_EVALUATOR", default=False
+        )
+        static_acc = _env_float("AGGREGATOR_STATIC_ACCURACY")
+        has_runtime_eval = self.runtime_evaluator is not None
+
+        if require_runtime_eval and not has_runtime_eval:
+            raise RuntimeError(
+                "AGGREGATOR_REQUIRE_RUNTIME_EVALUATOR=1 but no runtime evaluator is configured. "
+                "Set AGGREGATOR_EVALUATOR_HOOK or AGGREGATOR_VALIDATION_DATA_PATH/"
+                "AGGREGATOR_VALIDATION_DATA_LINK."
+            )
+
+        if has_runtime_eval and static_acc is not None:
+            logger.info(
+                "[Aggregator] Runtime evaluator is active; AGGREGATOR_STATIC_ACCURACY is ignored."
+            )
+
+        if self.state.current_model is None and self.state.initial_model_link:
+            try:
+                self.state.current_model = load_base_model_from_link(
+                    task_id=self.task_id,
+                    model_link=self.state.initial_model_link,
+                    static_accuracy=None if has_runtime_eval else static_acc,
+                )
+                logger.info(
+                    "[Aggregator] Loaded base model from task initialModelLink "
+                    f"({self.state.initial_model_link})"
+                )
+            except Exception as e:
+                logger.warning(
+                    "[Aggregator] Could not load base model from initialModelLink: "
+                    f"{e}"
+                )
+
+        # Strict-by-default: fail before expensive crypto if no base model is available.
+        if self.state.current_model is None and not allow_zero_base:
+            initial_link = self.state.initial_model_link
+            raise RuntimeError(
+                "Base model is missing before aggregation (current_model is None). "
+                f"Task initialModelLink={initial_link!r}. "
+                "Aggregator failed to load a runtime model from this link (or link is unavailable). "
+                "Either provide a loadable model artifact link, a preloaded model object in metadata, "
+                "or explicitly enable non-strict "
+                "fallback with AGGREGATOR_ALLOW_ZERO_BASE_MODEL=1 and AGGREGATOR_STATIC_ACCURACY."
+            )
+
+        if allow_zero_base and static_acc is None and not has_runtime_eval:
+            raise RuntimeError(
+                "AGGREGATOR_ALLOW_ZERO_BASE_MODEL=1 requires AGGREGATOR_STATIC_ACCURACY "
+                "(float in [0.0, 1.0]) to be set, unless a runtime evaluator is configured."
+            )
+
+        if (
+            isinstance(self.state.current_model, VectorModel)
+            and static_acc is None
+            and not has_runtime_eval
+        ):
+            raise RuntimeError(
+                "Vector-model runtime requires AGGREGATOR_STATIC_ACCURACY "
+                "(float in [0.0, 1.0]) or a runtime evaluator hook/data configuration."
+            )
+
+        self.min_participants = self._get_min_participants()
+        self.max_participants = self._get_max_participants()
+
+        logger.info(
+            f"[Aggregator] Keys and task metadata loaded | "
+            f"round={self.state.round}, target_acc={self.state.required_accuracy}, "
+            f"min_participants={self.min_participants}, max_rounds={self.state.max_rounds}"
+        )
+
+    # ------------------------------------------------------------------
+    # M4 – Submission Collection
+    # ------------------------------------------------------------------
+
+    def _wait_for_submissions(self) -> List[Dict]:
+        logger.info("[Aggregator] Waiting for miner submissions")
+
+        start = time.time()
+        # Keep latest submission per gradient id to avoid duplicates across polls.
+        submissions_by_id = {}
+
+        while time.time() - start < AGGREGATION_TIMEOUT:
+            batch = self.backend_rx.fetch_submissions()
+            if batch:
+                new_count = 0
+                for sub in batch:
+                    sub_id = sub.get("id")
+                    if not sub_id:
+                        continue
+                    if sub_id not in submissions_by_id:
+                        new_count += 1
+                    submissions_by_id[sub_id] = sub
+                logger.info(
+                    f"[Aggregator] Received {len(batch)} submissions "
+                    f"({new_count} new, {len(submissions_by_id)} unique total)"
+                )
+
+            if len(submissions_by_id) >= self.min_participants:
+                break
+
+            time.sleep(BACKEND_POLL_INTERVAL)
+
+        submissions = list(submissions_by_id.values())
+
+        valid_subs = collect_and_validate_submissions(
+            submissions=submissions,
+            task_id=self.task_id,
+            min_participants=self.min_participants,
+            max_participants=self.max_participants,
+        )
+
+        if len(valid_subs) < self.min_participants:
+            raise RuntimeError("Insufficient valid submissions")
+
+        self.progress.mark("submissions_collected")
+        return valid_subs
+
+    # ------------------------------------------------------------------
+    # M4 – Secure Aggregation
+    # ------------------------------------------------------------------
+
+    def _secure_aggregate(self, submissions: List[Dict]):
+        logger.info("[Aggregator] Performing NDD-FE secure aggregation")
+
+        # Align weights with the accepted submissions only.
+        # state.weights/state.participants are task-level metadata and may include
+        # miners whose submissions were rejected or missing.
+        participant_to_weight = {
+            pk: w for pk, w in zip(self.state.participants, self.state.weights)
+        }
+        active_weights = []
+        for sub in submissions:
+            miner_pk = sub.get("miner_pk")
+            if miner_pk not in participant_to_weight:
+                raise RuntimeError(
+                    f"Missing aggregation weight for submission miner_pk={miner_pk}"
+                )
+            active_weights.append(participant_to_weight[miner_pk])
+
+        aggregate = secure_aggregate(
+            submissions=submissions,
+            skFE=self.keys.skFE,
+            skA=self.keys.skA,
+            pkTP=self.keys.pkTP,
+            weights=active_weights,
+        )
+
+        self.progress.mark("aggregation_complete")
+        return aggregate
+
+    # ------------------------------------------------------------------
+    # M4 – Model Update & Evaluation
+    # ------------------------------------------------------------------
+
+    def _update_and_evaluate(self, aggregate):
+        logger.info("[Aggregator] Applying update and evaluating model")
+
+        if self.state.current_model is None:
+            # Explicit, non-strict fallback for environments without a real base-model runtime.
+            static_acc = (
+                None
+                if self.runtime_evaluator is not None
+                else _env_float("AGGREGATOR_STATIC_ACCURACY")
+            )
+            self.state.current_model = VectorModel(
+                [0.0] * len(aggregate),
+                static_accuracy=static_acc,
+            )
+            logger.warning(
+                "[Aggregator] Using zero-initialized base model "
+                "(AGGREGATOR_ALLOW_ZERO_BASE_MODEL=1). "
+                "This mode is for controlled testing only."
+            )
+
+        new_model = apply_model_update(
+            base_model=self.state.current_model,
+            aggregate_update=aggregate,
+        )
+
+        acc = evaluate_model(new_model, evaluator=self.runtime_evaluator)
+
+        self.state.update_model(new_model)
+        self.progress.mark("model_evaluated")
+
+        logger.info(f"[Aggregator] Model accuracy: {acc:.4f}")
+        return new_model, acc
+
+    # ------------------------------------------------------------------
+    # M4 – Candidate Block
+    # ------------------------------------------------------------------
+
+    def _form_candidate(self, model, acc, submissions):
+        logger.info("[Aggregator] Building candidate block")
+
+        model_link, artifact_hash = publish_model_artifact(
+            model,
+            task_id=self.task_id,
+            round_no=self.state.round,
+        )
+
+        model_meta = {
+            "task_id": self.task_id,
+            "round": int(self.state.round),
+            "num_parameters": len(model.get_weights()) if hasattr(model, "get_weights") else 0,
+            "model_type": model.__class__.__name__,
+        }
+        model_hash = compute_candidate_model_hash(
+            model_link=model_link,
+            artifact_hash=artifact_hash,
+            metadata=model_meta,
+        )
+
+        candidate = build_candidate_block(
+            task_id=self.task_id,
+            round_no=self.state.round,
+            model_hash=model_hash,
+            model_link=model_link,
+            accuracy=acc,
+            submissions=submissions,
+            aggregator_pk=self.keys.pkA,
+        )
+
+        # Algorithm 4 (line 42): B.signatureA <- Sign(skA, HASH(B))
+        signature_a = sign_hash_hex_with_scalar(
+            private_scalar=self.keys.skA,
+            hash_hex=candidate["hash"],
+        )
+        candidate["artifact_hash"] = artifact_hash
+        candidate["model_metadata"] = model_meta
+        candidate["signature_a"] = signature_a
+        candidate["signatureA"] = signature_a
+        self.state.set_candidate_block(candidate)
+        self.state.set_status("AWAITING_VERIFICATION")
+
+        if not self.backend_tx.broadcast_candidate(candidate):
+            raise RuntimeError(
+                "Candidate broadcast failed. Backend rejected /submit-candidate."
+            )
+        self.progress.mark("candidate_built")
+
+        return candidate
+
+    # ------------------------------------------------------------------
+    # M5 – Miner Verification
+    # ------------------------------------------------------------------
+
+    def _run_miner_verification(self, candidate) -> bool:
+        logger.info("[Aggregator] Collecting miner verification feedback")
+        self.state.set_status(TASK_STATE_VERIFYING)
+
+        feedback = collect_feedback(
+            backend_rx=self.backend_rx,
+            task_id=self.task_id,
+            candidate_hash=candidate["hash"],
+            expected_participants=candidate["participants"],
+            timeout=FEEDBACK_TIMEOUT,
+        )
+
+        result = has_majority(
+            feedback,
+            total_participants=len(candidate["participants"]),
+        )
+
+        self.progress.mark("verification_complete")
+        return result
+
+    # ------------------------------------------------------------------
+    # M6 – Publish Payload
+    # ------------------------------------------------------------------
+
+    def _publish_candidate(self, candidate):
+        logger.info("[Aggregator] Publishing verified payload to backend")
+
+        payload = {
+            **candidate,
+            "verification": "MAJORITY_VALID",
+            "timestamp": int(time.time()),
+        }
+
+        if not self.backend_tx.publish_payload(payload):
+            raise RuntimeError(
+                "Publish failed. Backend rejected /aggregator/publish or on-chain publish failed."
+            )
+        self.progress.mark("published")
+
+
+# ----------------------------------------------------------------------
+# CLI Entry
+# ----------------------------------------------------------------------
+
+def main():
+    task_id = os.getenv("TASK_ID")
+    if not task_id:
+        raise EnvironmentError("TASK_ID not set")
+
+    aggregator = HealChainAggregator(task_id)
+    aggregator.run()
+
+
+if __name__ == "__main__":
+    main()

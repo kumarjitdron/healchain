@@ -1,0 +1,20 @@
+pycryptodome>=3.18.0
+ecdsa>=0.18.0
+eth-hash[pycryptodome]>=0.5.1
+
+# Machine learning
+tensorflow>=2.12.0
+tensorflow-datasets>=4.9.0
+numpy>=1.24
+
+# HTTP and environment
+requests>=2.31
+python-dotenv>=1.0.0
+flask>=2.3.0
+flask-cors>=4.0.0
+
+# Note: web3 dependencies removed to avoid compilation issues
+# Install web3 separately if needed: pip install web3 --no-deps
+
+# Image processing
+Pillow>=10.0.0
