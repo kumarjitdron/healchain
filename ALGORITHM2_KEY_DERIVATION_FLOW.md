@@ -1,34 +1,34 @@
 # Algorithm 2: Key Derivation Flow Analysis
 
-## ✅ Implementation Status: COMPLETE
+##  Implementation Status: COMPLETE
 
-### ✅ What's Working
+###  What's Working
 
 1. **Key Derivation (Algorithm 2.2)** - `backend/src/crypto/keyDerivation.ts`
-   - ✅ Implements `deriveFunctionalEncryptionKey(taskID)`
-   - ✅ Uses: `skFE = H(publisherAddr || minerPKs || taskID || nonceTP)`
-   - ✅ Deterministic: Same inputs = same skFE
-   - ✅ Validates all inputs are present
+   - Implements `deriveFunctionalEncryptionKey(taskID)`
+   - Uses: `skFE = H(publisherAddr || minerPKs || taskID || nonceTP)`
+   - Deterministic: Same inputs = same skFE
+   - Validates all inputs are present
 
 2. **Key Delivery (Algorithm 2.3)** - `backend/src/crypto/keyDelivery.ts`
-   - ✅ Encrypts skFE with aggregator address
-   - ✅ Stores in `KeyDelivery` table
-   - ✅ API endpoint: `GET /aggregator/key/:taskID?aggregatorAddress=0x...`
-   - ✅ API endpoint: `GET /aggregator/key-derivation/:taskID` (for metadata)
+   - Encrypts skFE with aggregator address
+   - Stores in `KeyDelivery` table
+   - API endpoint: `GET /aggregator/key/:taskID?aggregatorAddress=0x...`
+   - API endpoint: `GET /aggregator/key-derivation/:taskID` (for metadata)
 
 3. **Automatic Trigger** - `backend/src/services/minerSelectionService.ts`
-   - ✅ When >= 3 miners with verified proofs register
-   - ✅ `finalizeMiners()` is called automatically
-   - ✅ Steps executed:
-     1. PoS aggregator selection (Algorithm 2.1) ✅
-     2. Key derivation (Algorithm 2.2) ✅
-     3. Key delivery (Algorithm 2.3) ✅
+   - When >= 3 miners with verified proofs register
+   - `finalizeMiners()` is called automatically
+   - Steps executed:
+     1. PoS aggregator selection (Algorithm 2.1) 
+     2. Key derivation (Algorithm 2.2) 
+     3. Key delivery (Algorithm 2.3) 
 
-4. **Aggregator Key Retrieval** - `aggregator/src/state/key_manager.py` ✅ **FIXED!**
-   - ✅ Aggregator fetches key derivation metadata from backend
-   - ✅ Derives skFE deterministically using same method as backend
-   - ✅ Uses keccak256 (pycryptodome) matching backend's ethers.keccak256
-   - ✅ Fallback to `FE_FUNCTION_KEY` env var if backend fetch fails
+4. **Aggregator Key Retrieval** - `aggregator/src/state/key_manager.py`  **FIXED!**
+   -  Aggregator fetches key derivation metadata from backend
+   -  Derives skFE deterministically using same method as backend
+   -  Uses keccak256 (pycryptodome) matching backend's ethers.keccak256
+   -  Fallback to `FE_FUNCTION_KEY` env var if backend fetch fails
 
 ## Algorithm 2 Flow (BTP Report Section 4.3)
 
@@ -82,9 +82,9 @@
    ↓
    skFE = H(publisher || minerPKs || taskID || nonceTP)
    ↓
-   Same formula as backend = same skFE ✅
-   ↓
-   Uses skFE for NDD-FE decryption in M4 ✅
+   Same formula as backend = same skFE 
+   
+   Uses skFE for NDD-FE decryption in M4 
 ```
 
 ## Current Implementation Details
@@ -118,12 +118,12 @@ export async function deriveFunctionalEncryptionKey(taskID: string): Promise<big
 ```
 
 **Note**: Current implementation uses:
-- ✅ `pkTP` (publisher address) - implicit via task.publisher
-- ❌ `skTP` - NOT used (not needed for deterministic derivation)
-- ✅ `validMiners` - miner public keys
-- ❌ `ctr` - NOT used (could be added for additional security)
-- ❌ `y` - NOT used (weight vector, could be added)
-- ✅ `aux = taskID` - used
+- `pkTP` (publisher address) - implicit via task.publisher
+- `skTP` - NOT used (not needed for deterministic derivation)
+- `validMiners` - miner public keys
+- `ctr` - NOT used (could be added for additional security)
+- `y` - NOT used (weight vector, could be added)
+- `aux = taskID` - used
 
 ### Backend: Key Delivery
 
@@ -155,10 +155,10 @@ export async function secureDeliverKey(
 
 ```python
 def load(self, backend_receiver=None, aggregator_address: str = None):
-    # ✅ Fetches metadata from backend
+    #  Fetches metadata from backend
     metadata = backend_receiver.fetch_key_derivation_metadata()
     
-    # ✅ Derives skFE deterministically (Algorithm 2.2)
+    #  Derives skFE deterministically (Algorithm 2.2)
     self.skFE = self.derive_skfe_from_task(
         publisher_address=metadata["publisher"],
         miner_public_keys=metadata["minerPublicKeys"],
@@ -167,7 +167,7 @@ def load(self, backend_receiver=None, aggregator_address: str = None):
     # Uses keccak256 (pycryptodome) - same as backend
 ```
 
-**Status**: ✅ **COMPLETE** - Aggregator correctly implements Algorithm 2.2
+**Status**:  **COMPLETE** - Aggregator correctly implements Algorithm 2.2
 
 ## Implementation Details
 
@@ -249,27 +249,27 @@ def _initialize_keys(self):
 
 ## Algorithm 2 Compliance Checklist
 
-- [x] **Algorithm 2.1**: PoS aggregator selection ✅
-- [x] **Algorithm 2.2**: Key derivation (backend + aggregator) ✅
-- [x] **Algorithm 2.3**: Key delivery (encrypted storage) ✅
-- [x] **Aggregator Retrieval**: Fetch metadata and derive skFE ✅ **FIXED!**
+- [x] **Algorithm 2.1**: PoS aggregator selection 
+- [x] **Algorithm 2.2**: Key derivation (backend + aggregator) 
+- [x] **Algorithm 2.3**: Key delivery (encrypted storage) 
+- [x] **Aggregator Retrieval**: Fetch metadata and derive skFE  **FIXED!**
 
 ## Summary
 
-**Current Status**: ✅ **COMPLETE**
+**Current Status**:  **COMPLETE**
 - Backend correctly implements Algorithm 2.1, 2.2, and 2.3
 - Key derivation happens automatically when >= 3 miners register
 - Key is encrypted and stored in database
 - API endpoint exists for aggregator to fetch key derivation metadata
-- **Aggregator fetches metadata and derives skFE deterministically** ✅
-- **Same formula as backend = same skFE** ✅
-- **Algorithm 2.2 fully compliant** ✅
+- **Aggregator fetches metadata and derives skFE deterministically** 
+- **Same formula as backend = same skFE** 
+- **Algorithm 2.2 fully compliant** 
 
 **Implementation**:
-- ✅ Aggregator fetches key derivation metadata from backend
-- ✅ Derives skFE using same deterministic method as backend
-- ✅ Uses keccak256 (pycryptodome) matching backend's ethers.keccak256
-- ✅ Fallback to `FE_FUNCTION_KEY` env var if backend fetch fails (for development)
+-  Aggregator fetches key derivation metadata from backend
+-  Derives skFE using same deterministic method as backend
+-  Uses keccak256 (pycryptodome) matching backend's ethers.keccak256
+-  Fallback to `FE_FUNCTION_KEY` env var if backend fetch fails (for development)
 
-**Status**: ✅ **100% COMPLIANT** with Algorithm 2
+**Status**:  **100% COMPLIANT** with Algorithm 2
 

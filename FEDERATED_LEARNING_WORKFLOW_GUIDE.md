@@ -8,14 +8,14 @@ This guide walks you through the complete workflow from miner registration to fe
 
 Before starting, ensure:
 
-1. ✅ **Backend is running** on port 3000
-2. ✅ **Blockchain node** is running (Ganache for development)
-3. ✅ **Smart contracts deployed** (HealChainEscrow, RewardDistribution)
-4. ✅ **Contract addresses configured** in `.env.local` (automatically updated by deployment script)
-5. ✅ **Task is published** with escrow automatically locked (M1) - **NEW: Escrow is locked before task creation**
-6. ✅ **At least 3 miners registered** with verified proofs (M2)
-7. ✅ **Aggregator is selected** via PoS (Algorithm 2.1)
-8. ✅ **skFE is derived** and available to aggregator (Algorithm 2.2)
+1.  **Backend is running** on port 3000
+2.  **Blockchain node** is running (Ganache for development)
+3.  **Smart contracts deployed** (HealChainEscrow, RewardDistribution)
+4.  **Contract addresses configured** in `.env.local` (automatically updated by deployment script)
+5.  **Task is published** with escrow automatically locked (M1) - **NEW: Escrow is locked before task creation**
+6.  **At least 3 miners registered** with verified proofs (M2)
+7.  **Aggregator is selected** via PoS (Algorithm 2.1)
+8.  **skFE is derived** and available to aggregator (Algorithm 2.2)
 
 ## Complete Workflow
 
@@ -26,9 +26,9 @@ M2: Miner Registration (Frontend + Backend)
   ↓
   [When >= 3 verified miners]
   ↓
-  Algorithm 2.1: PoS Aggregator Selection ✅
-  Algorithm 2.2: Key Derivation (skFE) ✅
-  Algorithm 2.3: Key Delivery ✅
+  Algorithm 2.1: PoS Aggregator Selection 
+  Algorithm 2.2: Key Derivation (skFE) 
+  Algorithm 2.3: Key Delivery 
   ↓
 M3: FL Client Training (Python)
   ↓
@@ -69,9 +69,9 @@ M7: Score Reveal & Rewards (Frontend + Smart Contract)
 5. **Step 5**: Backend creates task with status `OPEN` (only if verification succeeds)
 
 **Result**: 
-- ✅ Escrow locked on-chain
-- ✅ Task created with status = `OPEN` (not `CREATED`)
-- ✅ Task ready for miner registration
+-  Escrow locked on-chain
+-  Task created with status = `OPEN` (not `CREATED`)
+-  Task ready for miner registration
 
 **Note**: If escrow verification fails, the task is **not created** in the backend. You must ensure:
 - You have sufficient ETH balance
@@ -89,11 +89,11 @@ M7: Score Reveal & Rewards (Frontend + Smart Contract)
   5. Submit registration
 
 **Backend**: Automatically when >= 3 miners register:
-- ✅ Verify proofs (Algorithm 2)
-- ✅ Select aggregator via PoS (Algorithm 2.1)
-- ✅ Derive skFE (Algorithm 2.2)
-- ✅ Deliver key (Algorithm 2.3)
-- ✅ Update task status to `OPEN`
+-  Verify proofs (Algorithm 2)
+-  Select aggregator via PoS (Algorithm 2.1)
+-  Derive skFE (Algorithm 2.2)
+-  Deliver key (Algorithm 2.3)
+-  Update task status to `OPEN`
 
 **Check**: Verify aggregator is selected:
 ```bash
@@ -215,7 +215,7 @@ For each registered task, the FL client:
 
 **Expected Output**:
 ```
-✅ Found 1 tasks from backend
+ Found 1 tasks from backend
 [M3] Prepared submission for task task_001
 {
   "taskID": "task_001",
@@ -677,14 +677,14 @@ See `frontend/README.md` for M7 implementation details.
 
 ---
 
-## Status: ✅ Ready for Training
+## Status:  Ready for Training
 
 All components are configured and ready:
-- ✅ Algorithm 2.2: Key derivation working
-- ✅ M3: FL client service ready for frontend-triggered training
-- ✅ M4: Aggregator service ready for frontend-triggered aggregation
-- ✅ Backend APIs ready with orchestration endpoints
-- ✅ Frontend mining dashboard with training/aggregation controls
+-  Algorithm 2.2: Key derivation working
+-  M3: FL client service ready for frontend-triggered training
+-  M4: Aggregator service ready for frontend-triggered aggregation
+-  Backend APIs ready with orchestration endpoints
+-  Frontend mining dashboard with training/aggregation controls
 
 ## Recent Workflow Improvements
 
@@ -698,11 +698,11 @@ All components are configured and ready:
 5. **Deployment Automation**: Contract addresses automatically updated in `.env` files after deployment
 
 **Benefits**:
-- ✅ Guaranteed escrow lock before task creation
-- ✅ No orphaned tasks without escrow
-- ✅ Better error handling and user feedback
-- ✅ Automatic environment configuration
-- ✅ Production-ready workflow
+-  Guaranteed escrow lock before task creation
+-  No orphaned tasks without escrow
+-  Better error handling and user feedback
+-  Automatic environment configuration
+-  Production-ready workflow
 
 ### Frontend-Triggered Training & Aggregation
 
@@ -714,11 +714,11 @@ All components are configured and ready:
 5. **Better UX**: All operations can be triggered and monitored from the web interface
 
 **Benefits**:
-- ✅ Centralized control from frontend
-- ✅ Real-time status monitoring
-- ✅ Better user experience
-- ✅ Easier to manage multiple miners/tasks
-- ✅ No need to manually run Python scripts
+-  Centralized control from frontend
+-  Real-time status monitoring
+-  Better user experience
+-  Easier to manage multiple miners/tasks
+-  No need to manually run Python scripts
 
 **You can now proceed with federated learning training via the frontend mining dashboard!**
 
